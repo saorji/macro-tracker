@@ -336,7 +336,10 @@ function computeTargets(p) {
     calories: r0(calories), protein: a.protein, carbs: a.carbs, fat: a.fat,
     fiber: r0(fiber), custom: false,
     floor: r0(floor), proteinRefKg: r1(refKg), manualBelowFloor, manualClamped,
-    proteinReduced: a.proteinReduced, incoherent: a.incoherent, minCoherentKcal: a.minCoherentKcal
+    proteinReduced: a.proteinReduced, incoherent: a.incoherent, minCoherentKcal: a.minCoherentKcal,
+    // the bodyweight these numbers were derived from — TDEE falls as weight
+    // does, so the app can tell when the plan has drifted from the person
+    atWeightKg: r1(p.weightKg), computedAt: Date.now()
   };
 }
 
@@ -410,8 +413,26 @@ const defaultDB = () => ({
   settings: { theme: 'system', units: 'metric' },
   usage: {},
   myPortions: {},               // foodId -> [{id,label,qty,unit,fav}]
-  meta: { lastExport: null, backupSnoozeUntil: null }
+  deletedLib: [],               // starter-food ids the user removed, so load() won't re-seed them
+  meta: { lastExport: null, backupSnoozeUntil: null, recalcSnoozeUntil: null }
 });
+
+/* ---------- deleting a food ----------
+   Logged entries, recipe ingredients and saved meals are all snapshots, so
+   removing a food never rewrites anything already recorded. Only the food's
+   own personal portions go with it. Starter foods are remembered by id so
+   the forward-compat re-seed in load() doesn't quietly bring them back. */
+function deleteFood(foodId) {
+  const f = DB.foods.find(x => x.id === foodId);
+  if (!f) return false;
+  DB.foods = DB.foods.filter(x => x.id !== foodId);
+  if (f.lib) {
+    if (!Array.isArray(DB.deletedLib)) DB.deletedLib = [];
+    if (!DB.deletedLib.includes(foodId)) DB.deletedLib.push(foodId);
+  }
+  if (DB.myPortions) delete DB.myPortions[foodId];
+  return true;
+}
 
 /* ---------- personal portions ----------
    "My usual eba = 80 g dry garri". Keyed by food id so it follows the food,
@@ -464,6 +485,9 @@ function load() {
     // re-seed any library foods the user hasn't deleted/edited (forward compat)
     const have = new Set((DB.foods || []).map(f => f.id));
     starterFoods().forEach(f => { if (!have.has(f.id) && !(DB.deletedLib || []).includes(f.id)) DB.foods.push(f); });
+    // targets saved before the app recorded their reference weight: the profile
+    // weight is the closest thing available, so drift is measured from here on
+    if (DB.targets && DB.profile && DB.targets.atWeightKg == null) DB.targets.atWeightKg = r1(num(DB.profile.weightKg));
     return true;
   } catch (e) { console.warn('load failed', e); return false; }
 }

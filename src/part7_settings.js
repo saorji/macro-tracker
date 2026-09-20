@@ -27,7 +27,10 @@ function viewSettings() {
       </div>
       <div class="hint" style="margin-top:10px">Calculated targets come from Mifflin-St Jeor plus an activity
         multiplier — a decent starting estimate, not a measurement. If your weight isn't moving as expected after
-        two or three weeks of consistent logging, adjust by 100–200 kcal rather than making a large jump.</div>
+        two or three weeks of consistent logging, adjust by 100–200 kcal rather than making a large jump.${t.atWeightKg
+      ? ` These were worked out at ${r1(dispWeight(t.atWeightKg))} ${DB.settings.units === 'metric' ? 'kg' : 'lb'};
+        Today will suggest recalculating once your 7-day average has moved
+        ${r1(dispWeight(RECALC_AFTER_KG))} ${DB.settings.units === 'metric' ? 'kg' : 'lb'} from that.` : ''}</div>
     </div>
 
     <div class="card">
@@ -165,19 +168,7 @@ function mountSettings() {
     }
     commit();
   };
-  $('[data-act=recalcTargets]').onclick = () => confirmSheet('Recalculate targets?',
-    DB.profile.manualCalories
-      ? `This replaces your targets with fresh values from your details, and clears the manual calorie target of ` +
-      `${fmt(DB.profile.manualCalories)} kcal you set during setup — otherwise it would just be reapplied.`
-      : 'This replaces your current targets with fresh values calculated from your profile details.',
-    'Recalculate', () => {
-      // a manual override persisted on the profile would survive the recalc and
-      // make the button a no-op, so clearing it is part of recalculating
-      DB.profile = { ...DB.profile, manualCalories: null };
-      DB.targets = computeTargets(DB.profile);
-      refreshTodayTargets();
-      save(); render(); toast('Targets recalculated');
-    });
+  $('[data-act=recalcTargets]').onclick = () => openRecalcConfirm();
   $('[data-act=editProfile]').onclick = openProfileEditor;
 
   $$('#themeSeg button').forEach(b => b.onclick = () => {
@@ -188,7 +179,7 @@ function mountSettings() {
     DB.settings.units = b.dataset.u; save(); render();
   });
 
-  $('[data-act=export]').onclick = exportJSON;
+  $('[data-act=export]').onclick = () => exportJSON().then(ok => { if (ok && VIEW === 'settings') render(); });
   $('[data-act=csv]').onclick = exportCSV;
   $('[data-act=import]').onclick = () => $('#importFile').click();
   $('#importFile').onchange = e => {
@@ -215,6 +206,31 @@ function mountSettings() {
       VIEW = 'today'; CUR = todayKey(); HIST = todayKey(); CAL_MONTH = null;
       applyTheme(); render(); toast('All data erased');
     }, true);
+}
+
+/* Recalculate from the profile, optionally adopting a new current weight
+   first (the Today nudge passes the 7-day average). Used by the Settings
+   button and the nudge so both explain the same consequences. */
+function openRecalcConfirm(useWeightKg) {
+  const w = useWeightKg ? r1(useWeightKg) : null;
+  const unit = DB.settings.units === 'metric' ? 'kg' : 'lb';
+  const parts = [];
+  parts.push(w
+    ? `Your current weight becomes ${r1(dispWeight(w))} ${unit} — your 7-day average — and your targets are ` +
+    `replaced with fresh values from your details.`
+    : 'This replaces your current targets with fresh values calculated from your profile details.');
+  if (DB.profile.manualCalories) parts.push(`It also clears the manual calorie target of ` +
+    `${fmt(DB.profile.manualCalories)} kcal you set — otherwise it would just be reapplied.`);
+  if (DB.targets && DB.targets.custom) parts.push('The targets you set by hand will be overwritten.');
+  confirmSheet('Recalculate targets?', parts.join(' '), 'Recalculate', () => {
+    // a manual override persisted on the profile would survive the recalc and
+    // make the button a no-op, so clearing it is part of recalculating
+    DB.profile = { ...DB.profile, manualCalories: null };
+    if (w) DB.profile.weightKg = w;
+    DB.targets = computeTargets(DB.profile);
+    refreshTodayTargets();
+    save(); render(); toast('Targets recalculated');
+  });
 }
 
 function openProfileEditor() {
@@ -316,23 +332,68 @@ function watchSystemTheme() {
   else if (mq.addListener) mq.addListener(onChange);
 }
 
-/* ---------- export / import ---------- */
-function download(filename, text, mime) {
-  const blob = new Blob([text], { type: mime || 'application/json' });
+/* ---------- export / import ----------
+   Getting a file OUT of a Home Screen web app on iOS is the fragile part.
+   An <a download> on a blob URL is fine in a normal browser tab, but in
+   standalone mode it has a history of opening a blank page or doing nothing,
+   and it never reports failure. On touch devices the share sheet is the
+   dependable route — it offers Save to Files, AirDrop, mail — and it tells
+   us whether the person actually went through with it. Desktop keeps the
+   plain download.                                                       */
+function isStandalone() {
+  return window.navigator.standalone === true ||
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+}
+function prefersShareSheet() {
+  const touch = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  return isStandalone() || touch;
+}
+function downloadViaAnchor(filename, blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = filename;
   document.body.appendChild(a); a.click();
   setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 400);
 }
-function exportJSON() {
+/* Resolves to 'shared' | 'downloaded' | 'cancelled'. Must be called straight
+   from a tap handler — the share sheet requires a user gesture. */
+async function saveFile(filename, text, mime) {
+  const type = mime || 'application/json';
+  const blob = new Blob([text], { type });
+  if (prefersShareSheet() && navigator.share && navigator.canShare && typeof File === 'function') {
+    let file = null;
+    try { file = new File([blob], filename, { type }); } catch (e) { file = null; }
+    if (file && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: filename });
+        return 'shared';
+      } catch (e) {
+        // the person closed the sheet without picking anything: not an error,
+        // but nothing was saved either — anything else falls through
+        if (e && e.name === 'AbortError') return 'cancelled';
+        console.warn('share failed, falling back to download', e);
+      }
+    }
+  }
+  downloadViaAnchor(filename, blob);
+  return 'downloaded';
+}
+async function exportJSON() {
   if (!DB.meta) DB.meta = {};
-  DB.meta.lastExport = Date.now();
+  const now = Date.now();
+  // the backup itself should record when it was taken, but the app only
+  // believes a backup exists once the file has actually left
+  const payload = {
+    ...DB, meta: { ...DB.meta, lastExport: now, backupSnoozeUntil: null },
+    exportedAt: new Date(now).toISOString(), app: 'macrotracker', version: 1
+  };
+  const result = await saveFile(`macro-tracker-backup-${todayKey()}.json`, JSON.stringify(payload, null, 2));
+  if (result === 'cancelled') { toast('Backup not saved'); return false; }
+  DB.meta.lastExport = now;
   DB.meta.backupSnoozeUntil = null;
-  const payload = { ...DB, exportedAt: new Date().toISOString(), app: 'macrotracker', version: 1 };
-  download(`macro-tracker-backup-${todayKey()}.json`, JSON.stringify(payload, null, 2));
   save(true);
-  toast('Backup downloaded');
+  toast(result === 'shared' ? 'Backup saved' : 'Backup downloaded');
+  return true;
 }
 function csvCell(v) {
   const s = String(v == null ? '' : v);
@@ -359,9 +420,9 @@ function exportCSV() {
       has ? (usesFallbackTargets(k) ? 'current (day predates snapshots)' : 'that day') : '',
       d.weight ? r1(d.weight) : '', has ? d.entries.length : 0]);
   });
-  download(`macro-tracker-history-${todayKey()}.csv`,
-    rows.map(r => r.map(csvCell).join(',')).join('\n'), 'text/csv');
-  toast('CSV downloaded');
+  saveFile(`macro-tracker-history-${todayKey()}.csv`,
+    rows.map(r => r.map(csvCell).join(',')).join('\n'), 'text/csv')
+    .then(r => toast(r === 'cancelled' ? 'CSV not saved' : r === 'shared' ? 'CSV saved' : 'CSV downloaded'));
 }
 function importJSON(text) {
   let parsed;

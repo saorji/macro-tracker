@@ -438,6 +438,7 @@ function viewToday() {
 
   <div class="wrap">
     ${backupBannerHTML()}
+    ${recalcNudgeHTML()}
     <div class="card">
       <div class="rings">
         <div class="ring-main" style="position:relative;width:118px;height:118px">
@@ -603,6 +604,7 @@ function mountToday() {
   act('plan', () => openMealPreview(guessMeal()));
   act('stilleat', () => openStillEat(CUR));
   mountBackupBanner();
+  mountRecalcNudge();
   act('copyday', () => openCopyDay(CUR));
   act('saveday', () => openSaveDayAsMeal(CUR));
   act('resetday', () => confirmSheet('Reset this day?',

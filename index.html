@@ -628,7 +628,10 @@ function computeTargets(p) {
     calories: r0(calories), protein: a.protein, carbs: a.carbs, fat: a.fat,
     fiber: r0(fiber), custom: false,
     floor: r0(floor), proteinRefKg: r1(refKg), manualBelowFloor, manualClamped,
-    proteinReduced: a.proteinReduced, incoherent: a.incoherent, minCoherentKcal: a.minCoherentKcal
+    proteinReduced: a.proteinReduced, incoherent: a.incoherent, minCoherentKcal: a.minCoherentKcal,
+    // the bodyweight these numbers were derived from — TDEE falls as weight
+    // does, so the app can tell when the plan has drifted from the person
+    atWeightKg: r1(p.weightKg), computedAt: Date.now()
   };
 }
 
@@ -702,8 +705,26 @@ const defaultDB = () => ({
   settings: { theme: 'system', units: 'metric' },
   usage: {},
   myPortions: {},               // foodId -> [{id,label,qty,unit,fav}]
-  meta: { lastExport: null, backupSnoozeUntil: null }
+  deletedLib: [],               // starter-food ids the user removed, so load() won't re-seed them
+  meta: { lastExport: null, backupSnoozeUntil: null, recalcSnoozeUntil: null }
 });
+
+/* ---------- deleting a food ----------
+   Logged entries, recipe ingredients and saved meals are all snapshots, so
+   removing a food never rewrites anything already recorded. Only the food's
+   own personal portions go with it. Starter foods are remembered by id so
+   the forward-compat re-seed in load() doesn't quietly bring them back. */
+function deleteFood(foodId) {
+  const f = DB.foods.find(x => x.id === foodId);
+  if (!f) return false;
+  DB.foods = DB.foods.filter(x => x.id !== foodId);
+  if (f.lib) {
+    if (!Array.isArray(DB.deletedLib)) DB.deletedLib = [];
+    if (!DB.deletedLib.includes(foodId)) DB.deletedLib.push(foodId);
+  }
+  if (DB.myPortions) delete DB.myPortions[foodId];
+  return true;
+}
 
 /* ---------- personal portions ----------
    "My usual eba = 80 g dry garri". Keyed by food id so it follows the food,
@@ -756,6 +777,9 @@ function load() {
     // re-seed any library foods the user hasn't deleted/edited (forward compat)
     const have = new Set((DB.foods || []).map(f => f.id));
     starterFoods().forEach(f => { if (!have.has(f.id) && !(DB.deletedLib || []).includes(f.id)) DB.foods.push(f); });
+    // targets saved before the app recorded their reference weight: the profile
+    // weight is the closest thing available, so drift is measured from here on
+    if (DB.targets && DB.profile && DB.targets.atWeightKg == null) DB.targets.atWeightKg = r1(num(DB.profile.weightKg));
     return true;
   } catch (e) { console.warn('load failed', e); return false; }
 }
@@ -1379,6 +1403,7 @@ function viewToday() {
 
   <div class="wrap">
     ${backupBannerHTML()}
+    ${recalcNudgeHTML()}
     <div class="card">
       <div class="rings">
         <div class="ring-main" style="position:relative;width:118px;height:118px">
@@ -1544,6 +1569,7 @@ function mountToday() {
   act('plan', () => openMealPreview(guessMeal()));
   act('stilleat', () => openStillEat(CUR));
   mountBackupBanner();
+  mountRecalcNudge();
   act('copyday', () => openCopyDay(CUR));
   act('saveday', () => openSaveDayAsMeal(CUR));
   act('resetday', () => confirmSheet('Reset this day?',
@@ -2101,7 +2127,9 @@ function openCustomFood(meal, presetName, labelMode, editFood) {
         Comma separated. These show up as quick-tap buttons when logging.</div>
     </div>
 
-    <div id="cPreview" class="note" style="display:none"></div>`;
+    <div id="cPreview" class="note" style="display:none"></div>
+    ${isEdit ? `<div class="btn-row" style="margin-top:14px">
+      <button class="btn sm danger" data-act="delfood">Delete food</button></div>` : ''}`;
 
   const foot = `<button class="btn" data-act="cancel">Cancel</button>
     <button class="btn primary" data-act="save">${isEdit ? 'Save food' : 'Save & add'}</button>`;
@@ -2167,6 +2195,19 @@ function openCustomFood(meal, presetName, labelMode, editFood) {
           ${fmt(kcalFromMacros)} kcal, which is ${fmt(Math.abs(diff))} ${diff > 0 ? 'more' : 'less'} than the calories you entered.
           Labels round, but a gap this size usually means a typo.</span>` : ''}`;
     }
+    const del = $('[data-act=delfood]');
+    if (del) del.onclick = () => confirmSheet('Delete this food?',
+      `“${f.name}” will be removed from your foods. Anything you've already logged, and any recipe or saved meal ` +
+      `that uses it, keeps its numbers.${f.lib ? ' It is a starter food, so “Restore starter foods” in Settings can bring it back.' : ''}`,
+      'Delete', () => {
+        deleteFood(f.id);
+        save();
+        // the editor may be stacked on this food's portion sheet, which is now
+        // meaningless — drop everything above the meal plan, or everything
+        if (PREVIEW) { closeToPreview(); drawPreview(); }
+        else { closeSheet(true); if (VIEW === 'foods') render(); }
+        toast('Food deleted');
+      }, true);
     $('#sheetFoot [data-act=cancel]').onclick = () => closeSheet();
     $('#sheetFoot [data-act=save]').onclick = () => {
       const o = build();
@@ -2940,6 +2981,34 @@ function movingAvg(series, win) {
   });
 }
 
+/* ------------------------------------------------------------
+   TARGET DRIFT
+   Maintenance falls as weight does, and the per-day snapshots exist
+   precisely because targets are expected to change — but nothing told the
+   person when. This compares the 7-day average against the weight the
+   targets were computed at. It goes by the smoothed line, not a single
+   weigh-in, and wants two consecutive readings to agree, so one salty
+   dinner or a weekly weigh-in outlier can't trigger it on its own.
+   ------------------------------------------------------------ */
+const RECALC_AFTER_KG = 2.5;
+function weightDrift() {
+  const t = DB.targets, p = DB.profile;
+  if (!t || !p || t.atWeightKg == null) return null;
+  const ws = weightSeries();
+  if (ws.length < 2) return null;
+  const wma = movingAvg(ws, 7);
+  const last = wma[wma.length - 1], prev = wma[wma.length - 2];
+  const goal = num(p.goalWeightKg, 0);
+  // reaching the goal takes precedence: the plan still carries a deficit
+  if (goal && last.w <= goal && prev.w <= goal) {
+    return { goal: true, nowKg: last.w, atKg: t.atWeightKg, goalKg: goal, diffKg: last.w - t.atWeightKg, since: last.k };
+  }
+  const diff = last.w - t.atWeightKg, prevDiff = prev.w - t.atWeightKg;
+  if (Math.abs(diff) < RECALC_AFTER_KG || Math.abs(prevDiff) < RECALC_AFTER_KG) return null;
+  if (Math.sign(diff) !== Math.sign(prevDiff)) return null;
+  return { goal: false, nowKg: last.w, atKg: t.atWeightKg, goalKg: goal, diffKg: diff, since: last.k };
+}
+
 function viewProgress() {
   const keys = rangeKeys(progRange);
   const s = statsFor(keys);
@@ -3392,12 +3461,68 @@ function backupBannerHTML() {
 }
 function mountBackupBanner() {
   const ex = $('[data-act=bkExport]');
-  if (ex) ex.onclick = () => { exportJSON(); render(); };
+  if (ex) ex.onclick = () => exportJSON().then(ok => { if (ok && VIEW === 'today') render(); });
   const sn = $('[data-act=bkSnooze]');
   if (sn) sn.onclick = () => {
     if (!DB.meta) DB.meta = {};
     DB.meta.backupSnoozeUntil = Date.now() + 7 * 86400000;
     save(); render(); toast('Reminder snoozed for a week');
+  };
+}
+
+/* ============================================================
+   RECALCULATE REMINDER — shown on Today once the trend line has
+   moved well away from the weight the targets were built on
+   ============================================================ */
+function recalcNudgeHTML() {
+  if (CUR !== todayKey()) return '';
+  if (DB.meta && DB.meta.recalcSnoozeUntil && Date.now() < DB.meta.recalcSnoozeUntil) return '';
+  const d = weightDrift();
+  if (!d) return '';
+  const unit = DB.settings.units === 'metric' ? 'kg' : 'lb';
+  const W = kg => r1(dispWeight(kg));
+  const lighter = d.diffKg < 0;
+  let title, text, primary;
+  if (d.goal) {
+    title = 'You\'ve reached your goal weight';
+    text = `Your 7-day average is ${W(d.nowKg)} ${unit}, at or under the ${W(d.goalKg)} ${unit} you set as the goal.
+      The current targets still include a fat-loss deficit, so it's time to decide what comes next — a new goal, or
+      a slower rate — in your details.`;
+    primary = `<button class="btn sm primary" data-act="nudgeGoal">Update my details</button>`;
+  } else {
+    // ~10 kcal of BMR per kg, times the activity multiplier: a rough size for the drift
+    const kcal = r0(Math.abs(d.diffKg) * 10 * activityMultiplier(DB.profile));
+    title = `You're ${W(Math.abs(d.diffKg))} ${unit} ${lighter ? 'lighter' : 'heavier'} than your targets assume`;
+    text = `They were worked out at ${W(d.atKg)} ${unit}; your 7-day average is now ${W(d.nowKg)} ${unit}.
+      Maintenance ${lighter ? 'falls' : 'rises'} with bodyweight, so the plan is roughly ${kcal} kcal a day
+      ${lighter ? 'looser' : 'tighter'} than intended.${DB.targets.custom
+        ? ' You set the current targets by hand, so recalculating replaces them.' : ''}`;
+    primary = `<button class="btn sm primary" data-act="nudgeRecalc">Recalculate targets</button>`;
+  }
+  return `<div class="card tight" id="recalcNudge" style="border-color:var(--accent)">
+    <div style="display:flex;gap:11px;align-items:flex-start">
+      <span style="font-size:17px;line-height:1.3">⚖️</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:650;font-size:14.5px">${title}</div>
+        <div style="font-size:13px;color:var(--text-2);margin-top:2px;line-height:1.45">${text}</div>
+        <div class="btn-row" style="margin-top:10px">
+          ${primary}
+          <button class="btn sm" data-act="nudgeSnooze">Not now</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+function mountRecalcNudge() {
+  const rc = $('[data-act=nudgeRecalc]');
+  if (rc) rc.onclick = () => { const d = weightDrift(); if (d) openRecalcConfirm(d.nowKg); };
+  const gl = $('[data-act=nudgeGoal]');
+  if (gl) gl.onclick = openProfileEditor;
+  const sn = $('[data-act=nudgeSnooze]');
+  if (sn) sn.onclick = () => {
+    if (!DB.meta) DB.meta = {};
+    DB.meta.recalcSnoozeUntil = Date.now() + 14 * 86400000;
+    save(); render(); toast('Reminder snoozed for two weeks');
   };
 }
 /* ============================================================
@@ -3429,7 +3554,10 @@ function viewSettings() {
       </div>
       <div class="hint" style="margin-top:10px">Calculated targets come from Mifflin-St Jeor plus an activity
         multiplier — a decent starting estimate, not a measurement. If your weight isn't moving as expected after
-        two or three weeks of consistent logging, adjust by 100–200 kcal rather than making a large jump.</div>
+        two or three weeks of consistent logging, adjust by 100–200 kcal rather than making a large jump.${t.atWeightKg
+      ? ` These were worked out at ${r1(dispWeight(t.atWeightKg))} ${DB.settings.units === 'metric' ? 'kg' : 'lb'};
+        Today will suggest recalculating once your 7-day average has moved
+        ${r1(dispWeight(RECALC_AFTER_KG))} ${DB.settings.units === 'metric' ? 'kg' : 'lb'} from that.` : ''}</div>
     </div>
 
     <div class="card">
@@ -3567,19 +3695,7 @@ function mountSettings() {
     }
     commit();
   };
-  $('[data-act=recalcTargets]').onclick = () => confirmSheet('Recalculate targets?',
-    DB.profile.manualCalories
-      ? `This replaces your targets with fresh values from your details, and clears the manual calorie target of ` +
-      `${fmt(DB.profile.manualCalories)} kcal you set during setup — otherwise it would just be reapplied.`
-      : 'This replaces your current targets with fresh values calculated from your profile details.',
-    'Recalculate', () => {
-      // a manual override persisted on the profile would survive the recalc and
-      // make the button a no-op, so clearing it is part of recalculating
-      DB.profile = { ...DB.profile, manualCalories: null };
-      DB.targets = computeTargets(DB.profile);
-      refreshTodayTargets();
-      save(); render(); toast('Targets recalculated');
-    });
+  $('[data-act=recalcTargets]').onclick = () => openRecalcConfirm();
   $('[data-act=editProfile]').onclick = openProfileEditor;
 
   $$('#themeSeg button').forEach(b => b.onclick = () => {
@@ -3590,7 +3706,7 @@ function mountSettings() {
     DB.settings.units = b.dataset.u; save(); render();
   });
 
-  $('[data-act=export]').onclick = exportJSON;
+  $('[data-act=export]').onclick = () => exportJSON().then(ok => { if (ok && VIEW === 'settings') render(); });
   $('[data-act=csv]').onclick = exportCSV;
   $('[data-act=import]').onclick = () => $('#importFile').click();
   $('#importFile').onchange = e => {
@@ -3617,6 +3733,31 @@ function mountSettings() {
       VIEW = 'today'; CUR = todayKey(); HIST = todayKey(); CAL_MONTH = null;
       applyTheme(); render(); toast('All data erased');
     }, true);
+}
+
+/* Recalculate from the profile, optionally adopting a new current weight
+   first (the Today nudge passes the 7-day average). Used by the Settings
+   button and the nudge so both explain the same consequences. */
+function openRecalcConfirm(useWeightKg) {
+  const w = useWeightKg ? r1(useWeightKg) : null;
+  const unit = DB.settings.units === 'metric' ? 'kg' : 'lb';
+  const parts = [];
+  parts.push(w
+    ? `Your current weight becomes ${r1(dispWeight(w))} ${unit} — your 7-day average — and your targets are ` +
+    `replaced with fresh values from your details.`
+    : 'This replaces your current targets with fresh values calculated from your profile details.');
+  if (DB.profile.manualCalories) parts.push(`It also clears the manual calorie target of ` +
+    `${fmt(DB.profile.manualCalories)} kcal you set — otherwise it would just be reapplied.`);
+  if (DB.targets && DB.targets.custom) parts.push('The targets you set by hand will be overwritten.');
+  confirmSheet('Recalculate targets?', parts.join(' '), 'Recalculate', () => {
+    // a manual override persisted on the profile would survive the recalc and
+    // make the button a no-op, so clearing it is part of recalculating
+    DB.profile = { ...DB.profile, manualCalories: null };
+    if (w) DB.profile.weightKg = w;
+    DB.targets = computeTargets(DB.profile);
+    refreshTodayTargets();
+    save(); render(); toast('Targets recalculated');
+  });
 }
 
 function openProfileEditor() {
@@ -3718,23 +3859,68 @@ function watchSystemTheme() {
   else if (mq.addListener) mq.addListener(onChange);
 }
 
-/* ---------- export / import ---------- */
-function download(filename, text, mime) {
-  const blob = new Blob([text], { type: mime || 'application/json' });
+/* ---------- export / import ----------
+   Getting a file OUT of a Home Screen web app on iOS is the fragile part.
+   An <a download> on a blob URL is fine in a normal browser tab, but in
+   standalone mode it has a history of opening a blank page or doing nothing,
+   and it never reports failure. On touch devices the share sheet is the
+   dependable route — it offers Save to Files, AirDrop, mail — and it tells
+   us whether the person actually went through with it. Desktop keeps the
+   plain download.                                                       */
+function isStandalone() {
+  return window.navigator.standalone === true ||
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+}
+function prefersShareSheet() {
+  const touch = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  return isStandalone() || touch;
+}
+function downloadViaAnchor(filename, blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = filename;
   document.body.appendChild(a); a.click();
   setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 400);
 }
-function exportJSON() {
+/* Resolves to 'shared' | 'downloaded' | 'cancelled'. Must be called straight
+   from a tap handler — the share sheet requires a user gesture. */
+async function saveFile(filename, text, mime) {
+  const type = mime || 'application/json';
+  const blob = new Blob([text], { type });
+  if (prefersShareSheet() && navigator.share && navigator.canShare && typeof File === 'function') {
+    let file = null;
+    try { file = new File([blob], filename, { type }); } catch (e) { file = null; }
+    if (file && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: filename });
+        return 'shared';
+      } catch (e) {
+        // the person closed the sheet without picking anything: not an error,
+        // but nothing was saved either — anything else falls through
+        if (e && e.name === 'AbortError') return 'cancelled';
+        console.warn('share failed, falling back to download', e);
+      }
+    }
+  }
+  downloadViaAnchor(filename, blob);
+  return 'downloaded';
+}
+async function exportJSON() {
   if (!DB.meta) DB.meta = {};
-  DB.meta.lastExport = Date.now();
+  const now = Date.now();
+  // the backup itself should record when it was taken, but the app only
+  // believes a backup exists once the file has actually left
+  const payload = {
+    ...DB, meta: { ...DB.meta, lastExport: now, backupSnoozeUntil: null },
+    exportedAt: new Date(now).toISOString(), app: 'macrotracker', version: 1
+  };
+  const result = await saveFile(`macro-tracker-backup-${todayKey()}.json`, JSON.stringify(payload, null, 2));
+  if (result === 'cancelled') { toast('Backup not saved'); return false; }
+  DB.meta.lastExport = now;
   DB.meta.backupSnoozeUntil = null;
-  const payload = { ...DB, exportedAt: new Date().toISOString(), app: 'macrotracker', version: 1 };
-  download(`macro-tracker-backup-${todayKey()}.json`, JSON.stringify(payload, null, 2));
   save(true);
-  toast('Backup downloaded');
+  toast(result === 'shared' ? 'Backup saved' : 'Backup downloaded');
+  return true;
 }
 function csvCell(v) {
   const s = String(v == null ? '' : v);
@@ -3761,9 +3947,9 @@ function exportCSV() {
       has ? (usesFallbackTargets(k) ? 'current (day predates snapshots)' : 'that day') : '',
       d.weight ? r1(d.weight) : '', has ? d.entries.length : 0]);
   });
-  download(`macro-tracker-history-${todayKey()}.csv`,
-    rows.map(r => r.map(csvCell).join(',')).join('\n'), 'text/csv');
-  toast('CSV downloaded');
+  saveFile(`macro-tracker-history-${todayKey()}.csv`,
+    rows.map(r => r.map(csvCell).join(',')).join('\n'), 'text/csv')
+    .then(r => toast(r === 'cancelled' ? 'CSV not saved' : r === 'shared' ? 'CSV saved' : 'CSV downloaded'));
 }
 function importJSON(text) {
   let parsed;

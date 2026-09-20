@@ -424,7 +424,9 @@ function openCustomFood(meal, presetName, labelMode, editFood) {
         Comma separated. These show up as quick-tap buttons when logging.</div>
     </div>
 
-    <div id="cPreview" class="note" style="display:none"></div>`;
+    <div id="cPreview" class="note" style="display:none"></div>
+    ${isEdit ? `<div class="btn-row" style="margin-top:14px">
+      <button class="btn sm danger" data-act="delfood">Delete food</button></div>` : ''}`;
 
   const foot = `<button class="btn" data-act="cancel">Cancel</button>
     <button class="btn primary" data-act="save">${isEdit ? 'Save food' : 'Save & add'}</button>`;
@@ -490,6 +492,19 @@ function openCustomFood(meal, presetName, labelMode, editFood) {
           ${fmt(kcalFromMacros)} kcal, which is ${fmt(Math.abs(diff))} ${diff > 0 ? 'more' : 'less'} than the calories you entered.
           Labels round, but a gap this size usually means a typo.</span>` : ''}`;
     }
+    const del = $('[data-act=delfood]');
+    if (del) del.onclick = () => confirmSheet('Delete this food?',
+      `“${f.name}” will be removed from your foods. Anything you've already logged, and any recipe or saved meal ` +
+      `that uses it, keeps its numbers.${f.lib ? ' It is a starter food, so “Restore starter foods” in Settings can bring it back.' : ''}`,
+      'Delete', () => {
+        deleteFood(f.id);
+        save();
+        // the editor may be stacked on this food's portion sheet, which is now
+        // meaningless — drop everything above the meal plan, or everything
+        if (PREVIEW) { closeToPreview(); drawPreview(); }
+        else { closeSheet(true); if (VIEW === 'foods') render(); }
+        toast('Food deleted');
+      }, true);
     $('#sheetFoot [data-act=cancel]').onclick = () => closeSheet();
     $('#sheetFoot [data-act=save]').onclick = () => {
       const o = build();

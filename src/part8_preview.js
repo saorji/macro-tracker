@@ -223,11 +223,67 @@ function backupBannerHTML() {
 }
 function mountBackupBanner() {
   const ex = $('[data-act=bkExport]');
-  if (ex) ex.onclick = () => { exportJSON(); render(); };
+  if (ex) ex.onclick = () => exportJSON().then(ok => { if (ok && VIEW === 'today') render(); });
   const sn = $('[data-act=bkSnooze]');
   if (sn) sn.onclick = () => {
     if (!DB.meta) DB.meta = {};
     DB.meta.backupSnoozeUntil = Date.now() + 7 * 86400000;
     save(); render(); toast('Reminder snoozed for a week');
+  };
+}
+
+/* ============================================================
+   RECALCULATE REMINDER — shown on Today once the trend line has
+   moved well away from the weight the targets were built on
+   ============================================================ */
+function recalcNudgeHTML() {
+  if (CUR !== todayKey()) return '';
+  if (DB.meta && DB.meta.recalcSnoozeUntil && Date.now() < DB.meta.recalcSnoozeUntil) return '';
+  const d = weightDrift();
+  if (!d) return '';
+  const unit = DB.settings.units === 'metric' ? 'kg' : 'lb';
+  const W = kg => r1(dispWeight(kg));
+  const lighter = d.diffKg < 0;
+  let title, text, primary;
+  if (d.goal) {
+    title = 'You\'ve reached your goal weight';
+    text = `Your 7-day average is ${W(d.nowKg)} ${unit}, at or under the ${W(d.goalKg)} ${unit} you set as the goal.
+      The current targets still include a fat-loss deficit, so it's time to decide what comes next — a new goal, or
+      a slower rate — in your details.`;
+    primary = `<button class="btn sm primary" data-act="nudgeGoal">Update my details</button>`;
+  } else {
+    // ~10 kcal of BMR per kg, times the activity multiplier: a rough size for the drift
+    const kcal = r0(Math.abs(d.diffKg) * 10 * activityMultiplier(DB.profile));
+    title = `You're ${W(Math.abs(d.diffKg))} ${unit} ${lighter ? 'lighter' : 'heavier'} than your targets assume`;
+    text = `They were worked out at ${W(d.atKg)} ${unit}; your 7-day average is now ${W(d.nowKg)} ${unit}.
+      Maintenance ${lighter ? 'falls' : 'rises'} with bodyweight, so the plan is roughly ${kcal} kcal a day
+      ${lighter ? 'looser' : 'tighter'} than intended.${DB.targets.custom
+        ? ' You set the current targets by hand, so recalculating replaces them.' : ''}`;
+    primary = `<button class="btn sm primary" data-act="nudgeRecalc">Recalculate targets</button>`;
+  }
+  return `<div class="card tight" id="recalcNudge" style="border-color:var(--accent)">
+    <div style="display:flex;gap:11px;align-items:flex-start">
+      <span style="font-size:17px;line-height:1.3">⚖️</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:650;font-size:14.5px">${title}</div>
+        <div style="font-size:13px;color:var(--text-2);margin-top:2px;line-height:1.45">${text}</div>
+        <div class="btn-row" style="margin-top:10px">
+          ${primary}
+          <button class="btn sm" data-act="nudgeSnooze">Not now</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+function mountRecalcNudge() {
+  const rc = $('[data-act=nudgeRecalc]');
+  if (rc) rc.onclick = () => { const d = weightDrift(); if (d) openRecalcConfirm(d.nowKg); };
+  const gl = $('[data-act=nudgeGoal]');
+  if (gl) gl.onclick = openProfileEditor;
+  const sn = $('[data-act=nudgeSnooze]');
+  if (sn) sn.onclick = () => {
+    if (!DB.meta) DB.meta = {};
+    DB.meta.recalcSnoozeUntil = Date.now() + 14 * 86400000;
+    save(); render(); toast('Reminder snoozed for two weeks');
   };
 }

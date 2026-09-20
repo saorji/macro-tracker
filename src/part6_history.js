@@ -184,6 +184,34 @@ function movingAvg(series, win) {
   });
 }
 
+/* ------------------------------------------------------------
+   TARGET DRIFT
+   Maintenance falls as weight does, and the per-day snapshots exist
+   precisely because targets are expected to change — but nothing told the
+   person when. This compares the 7-day average against the weight the
+   targets were computed at. It goes by the smoothed line, not a single
+   weigh-in, and wants two consecutive readings to agree, so one salty
+   dinner or a weekly weigh-in outlier can't trigger it on its own.
+   ------------------------------------------------------------ */
+const RECALC_AFTER_KG = 2.5;
+function weightDrift() {
+  const t = DB.targets, p = DB.profile;
+  if (!t || !p || t.atWeightKg == null) return null;
+  const ws = weightSeries();
+  if (ws.length < 2) return null;
+  const wma = movingAvg(ws, 7);
+  const last = wma[wma.length - 1], prev = wma[wma.length - 2];
+  const goal = num(p.goalWeightKg, 0);
+  // reaching the goal takes precedence: the plan still carries a deficit
+  if (goal && last.w <= goal && prev.w <= goal) {
+    return { goal: true, nowKg: last.w, atKg: t.atWeightKg, goalKg: goal, diffKg: last.w - t.atWeightKg, since: last.k };
+  }
+  const diff = last.w - t.atWeightKg, prevDiff = prev.w - t.atWeightKg;
+  if (Math.abs(diff) < RECALC_AFTER_KG || Math.abs(prevDiff) < RECALC_AFTER_KG) return null;
+  if (Math.sign(diff) !== Math.sign(prevDiff)) return null;
+  return { goal: false, nowKg: last.w, atKg: t.atWeightKg, goalKg: goal, diffKg: diff, since: last.k };
+}
+
 function viewProgress() {
   const keys = rangeKeys(progRange);
   const s = statsFor(keys);
