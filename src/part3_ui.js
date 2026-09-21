@@ -159,7 +159,7 @@ function renderSetup() {
   document.body.classList.add('no-nav');
   const u = setupData.units, met = u === 'metric';
   APP.innerHTML = `
-  <div class="wrap" style="padding-top:26px;padding-bottom:40px;max-width:560px">
+  <div class="wrap" style="padding-top:calc(26px + var(--safe-t));padding-bottom:40px;max-width:560px">
     <div style="text-align:center;margin-bottom:22px">
       <div style="font-size:40px;line-height:1">🥗</div>
       <h1 style="margin-top:8px">Set up your targets</h1>

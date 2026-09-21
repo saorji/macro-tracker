@@ -17,6 +17,10 @@
   --shadow:0 1px 2px rgba(16,24,40,.06),0 4px 14px rgba(16,24,40,.06);
   --r:16px; --r-sm:10px;
   --safe-b:env(safe-area-inset-bottom,0px);
+  /* status bar / Dynamic Island. Zero in a normal browser tab; ~50–60px when
+     the page runs as a Home Screen app with a translucent status bar, where
+     the layout otherwise starts underneath the clock. */
+  --safe-t:env(safe-area-inset-top,0px);
 }
 /* Real dark mode: a true-black base rather than a dark-blue "night" tint.
    Depth comes from surfaces stepping up in lightness, the way iOS and
@@ -57,7 +61,9 @@ input,select,textarea{font:inherit;color:var(--text)}
 @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 
 /* header */
-.apphead{position:sticky;top:0;z-index:30;background:var(--bg);padding:10px 0 8px;
+/* sticky at the true top of the screen, padded down past the status bar, so
+   its background also covers the bar while the page scrolls beneath it */
+.apphead{position:sticky;top:0;z-index:30;background:var(--bg);padding:calc(10px + var(--safe-t)) 0 8px;
   border-bottom:1px solid transparent;transition:border-color .2s}
 .apphead.scrolled{border-color:var(--border)}
 .apphead .wrap{display:flex;align-items:center;justify-content:space-between;gap:10px}
@@ -247,7 +253,7 @@ html[data-theme="dark"] .badge.est{background:#33280f;color:#e8b45c;border-color
   background:var(--text);color:var(--bg);padding:11px 18px;border-radius:24px;font-size:14px;font-weight:600;
   z-index:80;opacity:0;pointer-events:none;transition:all .25s;max-width:88vw;text-align:center}
 .toast.show{opacity:1;transform:translateX(-50%)}
-.toast.top{bottom:auto;top:18px;transform:translateX(-50%) translateY(-20px)}
+.toast.top{bottom:auto;top:calc(18px + var(--safe-t));transform:translateX(-50%) translateY(-20px)}
 
 /* --- dark-mode refinements --- */
 html[data-theme="dark"] .nav{background:rgba(18,18,20,.82)}
@@ -272,7 +278,7 @@ html[data-theme="dark"] .star.on{color:#ffd426}
   .fab{bottom:24px}
   .macro-grid{grid-template-columns:repeat(3,1fr)}
   .macro-grid.three > .bar-row:nth-child(3){grid-column:auto}
-  .toast.top{top:24px}
+  .toast.top{top:calc(24px + var(--safe-t))}
 }
 </style>
 </head>
