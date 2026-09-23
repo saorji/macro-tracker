@@ -212,6 +212,131 @@ function weightDrift() {
   return { goal: false, nowKg: last.w, atKg: t.atWeightKg, goalKg: goal, diffKg: diff, since: last.k };
 }
 
+/* ------------------------------------------------------------
+   DEFICIT vs ACTUAL — the one check the app could make and didn't.
+
+   Two independent numbers are already recorded: what was logged against the
+   estimated maintenance, and what the scale actually did. The first predicts
+   a rate of loss; the second measures it. Where they disagree, the estimate
+   (population formula, ±10%) or the logging is off — and the measured trend
+   is the one to believe. Inverting it gives an implied maintenance, which is
+   a far better number for this person than any formula.
+
+   It refuses to answer on thin data: a fortnight of scale noise can imply
+   almost any maintenance, and a confident wrong number here would be worse
+   than no number.
+   ------------------------------------------------------------ */
+const KCAL_PER_KG = 7700;
+const REALITY_MIN_DAYS = 14, REALITY_MIN_WEIGHINS = 4, REALITY_MIN_LOGGED = 10;
+
+function energyReality(keys, s) {
+  if (!DB.targets || !s.loggedCount) return null;
+  const inRange = new Set(keys);
+  const pts = weightSeries().filter(p => inRange.has(p.k));
+  const spanDays = pts.length >= 2
+    ? (parseKey(pts[pts.length - 1].k) - parseKey(pts[0].k)) / 86400000 : 0;
+  const short = {
+    ready: false, weighIns: pts.length, spanDays: r0(spanDays), logged: s.loggedCount,
+    needWeighIns: REALITY_MIN_WEIGHINS, needDays: REALITY_MIN_DAYS, needLogged: REALITY_MIN_LOGGED
+  };
+  if (pts.length < REALITY_MIN_WEIGHINS || spanDays < REALITY_MIN_DAYS || s.loggedCount < REALITY_MIN_LOGGED) return short;
+
+  // least squares over the raw weigh-ins: uses every point rather than
+  // differencing two of them, so a single odd morning barely moves it
+  const t0 = parseKey(pts[0].k).getTime();
+  const xs = pts.map(p => (parseKey(p.k).getTime() - t0) / 86400000);
+  const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const my = pts.reduce((a, p) => a + p.w, 0) / pts.length;
+  let sxy = 0, sxx = 0;
+  xs.forEach((x, i) => { sxy += (x - mx) * (pts[i].w - my); sxx += (x - mx) * (x - mx); });
+  if (sxx <= 0) return short;
+  const actualPerWeek = (sxy / sxx) * 7;                    // kg/week, negative = losing
+
+  const intake = s.avg.calories, tdee = s.avgTdee;
+  const predictedPerWeek = -((tdee - intake) * 7) / KCAL_PER_KG;
+  const impliedTdee = intake + (-actualPerWeek * KCAL_PER_KG) / 7;
+  // logging gaps inflate the apparent deficit, because unlogged days count as
+  // nothing rather than as a normal day
+  const coverage = s.loggedCount / (spanDays + 1);
+  return {
+    ready: true, weighIns: pts.length, spanDays: r0(spanDays), logged: s.loggedCount,
+    intake, tdee, predictedPerWeek, actualPerWeek, impliedTdee,
+    gapPerWeek: actualPerWeek - predictedPerWeek,
+    tdeeGap: impliedTdee - tdee, coverage
+  };
+}
+
+function realityCardHTML(keys, s) {
+  const R = energyReality(keys, s);
+  if (!R) return '';
+  const unit = DB.settings.units === 'metric' ? 'kg' : 'lb';
+  const W = v => r1(DB.settings.units === 'metric' ? v : kgToLb(v));
+  const sign = v => (v > 0 ? '+' : '') + W(v);
+
+  if (!R.ready) {
+    const need = [];
+    if (R.weighIns < R.needWeighIns) need.push(`at least ${R.needWeighIns} weigh-ins in this window (you have ${R.weighIns})`);
+    if (R.spanDays < R.needDays) need.push(`weigh-ins spanning ${R.needDays}+ days (currently ${R.spanDays})`);
+    if (R.logged < R.needLogged) need.push(`${R.needLogged}+ logged days (you have ${R.logged})`);
+    return `<div class="card">
+      <div class="card-h"><h3>Is the estimate right?</h3></div>
+      <div class="empty" style="padding:6px 4px 10px;text-align:left">
+        Once there's enough data, this compares what you logged against what the scale did, and works out your real
+        maintenance calories rather than the formula's guess. It needs ${need.join(', ')}.${progRange === 7
+        ? ' Try the 30-day window too.' : ''}</div></div>`;
+  }
+
+  const losing = R.actualPerWeek < -0.02;
+  const closeRate = Math.abs(R.gapPerWeek) < 0.15;         // kg/week, inside scale noise
+  let verdict, tone;
+  if (closeRate) {
+    tone = 'var(--good)';
+    verdict = `Your logged intake predicted <b>${sign(R.predictedPerWeek)} ${unit}/week</b> and the scale shows
+      <b>${sign(R.actualPerWeek)}</b>. Those agree, which means the maintenance estimate of
+      ${fmt(R.tdee)} kcal is about right for you and the plan is doing what it says.`;
+  } else if (R.gapPerWeek > 0) {
+    tone = 'var(--warn)';
+    verdict = `Your logged intake predicted <b>${sign(R.predictedPerWeek)} ${unit}/week</b>, but the scale shows
+      <b>${sign(R.actualPerWeek)}</b> — ${losing ? 'slower than expected' : 'the wrong direction'}. Taken at face
+      value your maintenance is nearer <b>${fmt(R.impliedTdee)} kcal</b> than the estimated ${fmt(R.tdee)},
+      i.e. ${fmt(Math.abs(R.tdeeGap))} kcal ${R.tdeeGap < 0 ? 'lower' : 'higher'}. The other common explanation is
+      intake that isn't reaching the log — cooking oil, drinks, tastes while cooking, a day skipped after a big meal.`;
+  } else {
+    tone = 'var(--good)';
+    verdict = `The scale is moving <b>faster</b> than your logging predicted: <b>${sign(R.actualPerWeek)} ${unit}/week</b>
+      against a predicted ${sign(R.predictedPerWeek)}. That points to a maintenance nearer
+      <b>${fmt(R.impliedTdee)} kcal</b> than ${fmt(R.tdee)}. Worth checking it isn't a faster deficit than you
+      intended — if the rate is above about 1% of bodyweight a week, eating a little more protects muscle.`;
+  }
+
+  return `<div class="card">
+    <div class="card-h"><h3>Is the estimate right?</h3><span class="badge est">Estimate</span></div>
+    <div class="stat-grid" style="margin-bottom:12px">
+      <div class="stat"><div class="l">Predicted change</div>
+        <div class="n" style="font-size:19px">${sign(R.predictedPerWeek)} <span style="font-size:12px">${unit}/wk</span></div>
+        <div class="s">from ${fmt(R.intake)} kcal logged</div></div>
+      <div class="stat"><div class="l">Actual change</div>
+        <div class="n" style="font-size:19px;color:${tone}">${sign(R.actualPerWeek)} <span style="font-size:12px">${unit}/wk</span></div>
+        <div class="s">trend of ${R.weighIns} weigh-ins</div></div>
+      <div class="stat"><div class="l">Estimated maintenance</div>
+        <div class="n" style="font-size:19px">${fmt(R.tdee)}</div>
+        <div class="s">kcal, from the formula</div></div>
+      <div class="stat"><div class="l">Implied maintenance</div>
+        <div class="n" style="font-size:19px;color:var(--accent)">${fmt(R.impliedTdee)}</div>
+        <div class="s">kcal, from your own data</div></div>
+    </div>
+    <div class="coach-line"><span class="ic">${closeRate ? '✅' : '🔍'}</span><span>${verdict}</span></div>
+    ${R.coverage < 0.8 ? `<div class="coach-line"><span class="ic">📋</span><span>
+      You logged ${R.logged} of the ${R.spanDays + 1} days in this span. Unlogged days count as nothing here rather
+      than as a normal day, so the real average intake is probably higher than ${fmt(R.intake)} kcal and the
+      implied maintenance correspondingly higher too.</span></div>` : ''}
+    <div class="hint" style="margin-top:10px">Both sides of this are approximate: the conversion uses
+      ${fmt(KCAL_PER_KG)} kcal per kg of bodyweight, portion sizes carry error, and water and glycogen move the
+      scale independently of fat. Treat it as a direction rather than a measurement, and act on it only if it holds
+      over another couple of weeks — then adjust by 100–200 kcal rather than jumping to the implied number.</div>
+  </div>`;
+}
+
 function viewProgress() {
   const keys = rangeKeys(progRange);
   const s = statsFor(keys);
@@ -295,6 +420,8 @@ function viewProgress() {
            and the figures above are averages of both.` : ''}${s.anyFallback
         ? ` Some days predate per-day target tracking and fall back to your current targets.` : ''}</div>`}
     </div>
+
+    ${realityCardHTML(keys, s)}
 
     ${s.loggedCount ? `
     <div class="card">

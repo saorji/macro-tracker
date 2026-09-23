@@ -437,6 +437,7 @@ function viewToday() {
   </div></div>
 
   <div class="wrap">
+    ${updateBannerHTML()}
     ${backupBannerHTML()}
     ${recalcNudgeHTML()}
     <div class="card">
@@ -476,7 +477,7 @@ function viewToday() {
     <div class="card">
       <div class="card-h"><h3>Meals</h3>
         <div class="btn-row">
-          <button class="btn sm" data-act="copyday">Copy a day</button>
+          <button class="btn sm" data-act="copyday">Copy meal or day</button>
           ${nEntries ? `<button class="btn sm" data-act="saveday">Save as meal</button>` : ''}
         </div></div>
       ${MEALS.map(m => mealHTML(CUR, m)).join('')}
@@ -603,6 +604,7 @@ function mountToday() {
   act('add', () => openAddFood(guessMeal()));
   act('plan', () => openMealPreview(guessMeal()));
   act('stilleat', () => openStillEat(CUR));
+  mountUpdateBanner();
   mountBackupBanner();
   mountRecalcNudge();
   act('copyday', () => openCopyDay(CUR));

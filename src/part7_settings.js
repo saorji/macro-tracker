@@ -451,6 +451,77 @@ function importJSON(text) {
 }
 
 /* ============================================================
+   OFFLINE / SERVICE WORKER
+   The Home Screen icon has to open with no signal — a gym or a restaurant is
+   exactly where this app gets used and where the network is worst. The worker
+   precaches the app; here we only register it and handle the update, which is
+   deliberately never automatic: a reload in the middle of logging a meal
+   would throw away whatever sheet was open.
+   ============================================================ */
+let updateReady = false;
+function registerSW() {
+  if (!('serviceWorker' in navigator)) return;
+  // needs a secure context; opening index.html straight off disk has none
+  if (location.protocol !== 'https:' && location.hostname !== 'localhost') return;
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').then(reg => {
+      reg.addEventListener('updatefound', () => {
+        const sw = reg.installing;
+        if (!sw) return;
+        sw.addEventListener('statechange', () => {
+          // controller present means this is an update, not the first install
+          if (sw.state === 'installed' && navigator.serviceWorker.controller) offerUpdate(reg);
+        });
+      });
+      // a worker that finished installing while the app was closed
+      if (reg.waiting && navigator.serviceWorker.controller) offerUpdate(reg);
+    }).catch(err => console.warn('service worker registration failed', err));
+
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (reloading) return;
+      reloading = true;
+      location.reload();
+    });
+  });
+}
+function offerUpdate(reg) {
+  if (updateReady) return;
+  updateReady = true;
+  if (VIEW) render();            // surfaces the banner on Today
+}
+function updateBannerHTML() {
+  if (!updateReady || CUR !== todayKey()) return '';
+  return `<div class="card tight" id="updateBanner" style="border-color:var(--accent)">
+    <div style="display:flex;gap:11px;align-items:flex-start">
+      <span style="font-size:17px;line-height:1.3">⬆️</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:650;font-size:14.5px">A new version is ready</div>
+        <div style="font-size:13px;color:var(--text-2);margin-top:2px;line-height:1.45">
+          It's already downloaded and will be used the next time the app starts. Reloading now takes a second and
+          changes nothing you've logged.</div>
+        <div class="btn-row" style="margin-top:10px">
+          <button class="btn sm primary" data-act="swReload">Reload now</button>
+          <button class="btn sm" data-act="swLater">Later</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+function mountUpdateBanner() {
+  const r = $('[data-act=swReload]');
+  if (r) r.onclick = () => {
+    save(true);                  // flush any debounced write before the reload
+    navigator.serviceWorker.getRegistration().then(reg => {
+      if (reg && reg.waiting) { reg.waiting.postMessage('SKIP_WAITING'); setTimeout(() => location.reload(), 900); }
+      else location.reload();
+    }).catch(() => location.reload());
+  };
+  const l = $('[data-act=swLater]');
+  if (l) l.onclick = () => { updateReady = false; render(); toast('It will be applied next time you open the app'); };
+}
+
+/* ============================================================
    BOOT
    ============================================================ */
 let booted = false;
@@ -460,6 +531,7 @@ function boot() {
   load();
   applyTheme();
   watchSystemTheme();
+  registerSW();
   CUR = todayKey(); HIST = todayKey();
   render();
   // if the app is left open past midnight, roll the view to the new day

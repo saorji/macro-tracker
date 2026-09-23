@@ -640,27 +640,95 @@ function openSaveDayAsMeal(k) {
   });
 }
 
+/* ---------- copy a meal, or a whole day, from another date ----------
+   Eating the same lunch as Tuesday is the common case, and it used to mean
+   copying all four meals and deleting three of them. So the source is a meal
+   by default; the whole day is one of the choices rather than the only one.
+   A single meal can also land in a different meal slot — last night's dinner
+   becomes today's lunch — which is how leftovers actually work. */
 function openCopyDay(target) {
-  const keys = Object.keys(DB.days).filter(k => k !== target && DB.days[k].entries && DB.days[k].entries.length)
+  let src = 'all';                 // 'all' | a meal name
+  let dest = null;                 // meal to copy into; null = keep original meals
+
+  const daysWith = pick => Object.keys(DB.days)
+    .filter(k => k !== target && DB.days[k].entries && DB.days[k].entries.length)
+    .filter(k => pick === 'all' || DB.days[k].entries.some(e => e.meal === pick))
     .sort().reverse().slice(0, 30);
-  if (!keys.length) { toast('No other days with food logged yet'); return; }
+
+  if (!daysWith('all').length) { toast('No other days with food logged yet'); return; }
+
   const body = `
-    <p style="color:var(--text-2);font-size:14px;margin-bottom:12px">Copy everything logged on another day into
-      ${prettyDate(target).toLowerCase()}. Existing items stay — this adds on top.</p>
-    <div class="srch-res">${keys.map(k => {
-    const t = dayTotals(k);
-    return `<button class="res" data-copy="${k}">
-        <div class="info"><div class="nm">${esc(prettyDate(k))}</div>
-          <div class="sub">${DB.days[k].entries.length} items · ${fmt(t.calories)} kcal · P ${fmtG(t.protein)} g</div></div>
-        <span style="color:var(--accent);font-weight:700">Copy</span></button>`;
-  }).join('')}</div>`;
-  openSheet('Copy a day', body, `<button class="btn" data-act="close">Close</button>`, () => {
+    <div class="field" style="margin-bottom:12px"><span class="lbl">What to copy</span>
+      <!-- chips rather than a segmented control: five options don't fit a
+           single row on a 320px screen, and chips wrap where a seg squeezes -->
+      <div class="chips" id="cdSrc" style="margin-bottom:0">
+        <button class="chip on" data-s="all">Whole day</button>
+        ${MEALS.map(m => `<button class="chip" data-s="${m}">${MEAL_LABEL[m]}</button>`).join('')}
+      </div>
+    </div>
+    <div id="cdDest"></div>
+    <p style="color:var(--text-2);font-size:14px;margin-bottom:10px" id="cdIntro"></p>
+    <div id="cdList"></div>`;
+
+  openSheet('Copy a meal or day', body, `<button class="btn" data-act="close">Close</button>`, () => {
     $('#sheetFoot [data-act=close]').onclick = () => closeSheet();
-    $$('[data-copy]').forEach(b => b.onclick = () => {
-      const src = DB.days[b.dataset.copy];
-      const d = stampDay(target);
-      src.entries.forEach(e => d.entries.push({ ...e, id: uid(), at: Date.now(), nutr: { ...e.nutr } }));
-      save(); closeSheet(); render(); toast(`Copied ${src.entries.length} items`);
+
+    const items = k => src === 'all' ? DB.days[k].entries : DB.days[k].entries.filter(e => e.meal === src);
+
+    const drawDest = () => {
+      const box = $('#cdDest');
+      if (src === 'all') { box.innerHTML = ''; return; }
+      box.innerHTML = `<div class="field" style="margin-bottom:12px"><span class="lbl">Add to</span>
+        <div class="seg" id="cdDestSeg">${MEALS.map(m =>
+        `<button data-d="${m}" class="${(dest || src) === m ? 'on' : ''}">${MEAL_LABEL[m]}</button>`).join('')}</div></div>`;
+      $$('#cdDestSeg button').forEach(b => b.onclick = () => {
+        dest = b.dataset.d;
+        $$('#cdDestSeg button').forEach(x => x.classList.toggle('on', x === b));
+        drawList();
+      });
+    };
+
+    const drawList = () => {
+      const keys = daysWith(src);
+      const into = src === 'all' ? null : (dest || src);
+      $('#cdIntro').innerHTML = src === 'all'
+        ? `Copies every meal from the day you pick into ${esc(prettyDate(target).toLowerCase())}, keeping each item in
+           its own meal. Anything already logged stays — this adds on top.`
+        : `Copies that day's ${MEAL_LABEL[src].toLowerCase()} into <b>${MEAL_LABEL[into].toLowerCase()}</b> on
+           ${esc(prettyDate(target).toLowerCase())}. Anything already logged stays.`;
+      if (!keys.length) {
+        $('#cdList').innerHTML = `<div class="empty" style="padding:18px 4px">
+          No other day has ${MEAL_LABEL[src].toLowerCase()} logged.</div>`;
+        return;
+      }
+      $('#cdList').innerHTML = `<div class="srch-res">${keys.map(k => {
+        const list = items(k);
+        let t = zero();
+        list.forEach(e => { const n = entryNutr(e); MACROS.forEach(m => t[m] += n[m]); });
+        const names = list.map(e => e.name).join(', ');
+        return `<button class="res" data-copy="${k}">
+          <div class="info"><div class="nm">${esc(prettyDate(k))}</div>
+            <div class="sub">${list.length} item${list.length > 1 ? 's' : ''} · ${fmt(t.calories)} kcal · P ${fmtG(t.protein)} g</div>
+            <div class="sub" style="color:var(--text-3)">${esc(names)}</div></div>
+          <span style="color:var(--accent);font-weight:700">Copy</span></button>`;
+      }).join('')}</div>`;
+      $$('[data-copy]').forEach(b => b.onclick = () => {
+        const list = items(b.dataset.copy);
+        if (!list.length) return;
+        const d = stampDay(target);
+        list.forEach(e => d.entries.push({
+          ...e, id: uid(), at: Date.now(), nutr: { ...e.nutr }, meal: into || e.meal
+        }));
+        save(); closeSheet(); render();
+        toast(`Copied ${list.length} item${list.length > 1 ? 's' : ''}`);
+      });
+    };
+
+    $$('#cdSrc .chip').forEach(b => b.onclick = () => {
+      src = b.dataset.s; dest = null;
+      $$('#cdSrc .chip').forEach(x => x.classList.toggle('on', x === b));
+      drawDest(); drawList();
     });
+    drawDest(); drawList();
   });
 }
